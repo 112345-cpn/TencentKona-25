@@ -93,6 +93,7 @@
 #include "runtime/threadSMR.hpp"
 #include "runtime/vframe.hpp"
 #include "runtime/vm_version.hpp"
+#include "sanitizers/ub.hpp"
 #include "services/memoryService.hpp"
 #include "utilities/align.hpp"
 #include "utilities/checkedCast.hpp"
@@ -102,6 +103,7 @@
 #include "utilities/macros.hpp"
 #include "utilities/nativeCallStack.hpp"
 #include "utilities/ostream.hpp"
+#include "utilities/vmError.hpp"
 #if INCLUDE_G1GC
 #include "gc/g1/g1Arguments.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
@@ -156,6 +158,67 @@ class VM_WhiteBoxOperation : public VM_Operation {
   VMOp_Type type()                  const        { return VMOp_WhiteBoxOperation; }
   bool allow_nested_vm_operations() const        { return true; }
 };
+
+// VM operation used by WhiteBox to trigger a reproducible fatal error.
+class VM_ControlledCrash : public VM_Operation {
+ private:
+  const int _crash_type;
+
+ public:
+  explicit VM_ControlledCrash(int crash_type) : _crash_type(crash_type) {}
+  VMOp_Type type() const { return VMOp_ControlledCrash; }
+  void doit();
+};
+
+ATTRIBUTE_NO_UBSAN
+static void wb_crash_with_sigfpe() {
+  volatile int numerator = 1;
+  volatile int denominator = 0;
+  numerator = numerator / denominator;
+  fatal("controlledCrash: SIGFPE was not raised");
+}
+
+static void wb_crash_with_sigsegv() {
+  volatile int* const invalid_pointer =
+      reinterpret_cast<volatile int*>(VMError::segfault_address);
+  *invalid_pointer = 1;
+  fatal("controlledCrash: SIGSEGV was not raised");
+}
+
+void VM_ControlledCrash::doit() {
+  const char* const message = "controlled crash requested through WhiteBox";
+
+  switch (_crash_type) {
+    case 1:
+      fatal("%s (type 1)", message);
+      break;
+    case 2:
+      guarantee(false, "%s (type 2)", message);
+      break;
+    case 3:
+      vm_exit_out_of_memory(0, OOM_MALLOC_ERROR, "%s (type 3)", message);
+      break;
+    case 4:
+      wb_crash_with_sigsegv();
+      break;
+    case 5:
+      wb_crash_with_sigfpe();
+      break;
+    default:
+      fatal("controlledCrash: unexpected crash type %d", _crash_type);
+      break;
+  }
+}
+
+WB_ENTRY(void, WB_ControlledCrash(JNIEnv* env, jobject wb, jint crash_type))
+  if (crash_type < 1 || crash_type > 5) {
+    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(),
+              "controlledCrash: crash type must be between 1 and 5");
+  }
+
+  VM_ControlledCrash op(crash_type);
+  VMThread::execute(&op);
+WB_END
 
 
 WB_ENTRY(jlong, WB_GetObjectAddress(JNIEnv* env, jobject o, jobject obj))
@@ -2785,6 +2848,7 @@ WB_END
 #define CC (char*)
 
 static JNINativeMethod methods[] = {
+  {CC"controlledCrash",                 CC"(I)V", (void*)&WB_ControlledCrash},
   {CC"getObjectAddress0",                CC"(Ljava/lang/Object;)J", (void*)&WB_GetObjectAddress  },
   {CC"getObjectSize0",                   CC"(Ljava/lang/Object;)J", (void*)&WB_GetObjectSize     },
   {CC"isObjectInOldGen0",                CC"(Ljava/lang/Object;)Z", (void*)&WB_isObjectInOldGen  },

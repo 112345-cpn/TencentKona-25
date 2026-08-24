@@ -94,6 +94,12 @@ public class WhiteBox {
   }
 
   // Runtime
+  /**
+   * Trigger a reproducible fatal VM error for error-log and diagnostics tests.
+   * Crash types: 1=fatal, 2=guarantee, 3=native OOM, 4=SIGSEGV, 5=SIGFPE.
+   */
+  public native void controlledCrash(int crashType);
+
 
   // Returns the potentially abridged form of `str` as it would be
   // printed by the VM.
