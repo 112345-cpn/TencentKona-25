@@ -314,6 +314,12 @@ public class ObjectInputStream
 
     /** wire handle -> obj/exception map */
     private final HandleTable handles;
+    /** lazily sized scratch arrays reused by short-lived internal FieldValues
+     *  reads (never exposed to user code) */
+    private byte[] scratchPrimValues;
+    private Object[] scratchObjValues;
+    /** true while the scratch arrays above are borrowed by a FieldValues */
+    private boolean scratchInUse;
     /** scratch field for passing handle values up/down call stack */
     private int passHandle = NULL_HANDLE;
     /** flag set when at end of field value block with no TC_ENDBLOCKDATA */
@@ -616,10 +622,14 @@ public class ObjectInputStream
         bin.setBlockDataMode(false);
 
         // Read fields of the current descriptor into a new FieldValues
-        FieldValues values = new FieldValues(curDesc, true);
-        if (curObj != null) {
-            values.defaultCheckFieldValues(curObj);
-            values.defaultSetFieldValues(curObj);
+        FieldValues values = new FieldValues(curDesc, true, true);
+        try {
+            if (curObj != null) {
+                values.defaultCheckFieldValues(curObj);
+                values.defaultSetFieldValues(curObj);
+            }
+        } finally {
+            releaseScratch(values);
         }
         bin.setBlockDataMode(true);
         if (!curDesc.hasWriteObjectData()) {
@@ -2289,8 +2299,10 @@ public class ObjectInputStream
 
             if (slots[i].hasData) {
                 if (obj == null || handles.lookupException(passHandle) != null) {
-                    // Read fields of the current descriptor into a new FieldValues and discard
-                    new FieldValues(slotDesc, true);
+                    // Read fields of the current descriptor into a new
+                    // FieldValues and discard; arrays never escape, so reuse
+                    // the stream-level scratch when it is not borrowed.
+                    releaseScratch(new FieldValues(slotDesc, true, true));
                 } else if (slotDesc.hasReadObjectMethod()) {
                     SerialCallbackContext oldContext = curContext;
                     if (oldContext != null)
@@ -2324,14 +2336,18 @@ public class ObjectInputStream
                     defaultDataEnd = false;
                 } else {
                     // Read fields of the current descriptor into a new FieldValues
-                    FieldValues values = new FieldValues(slotDesc, true);
+                    FieldValues values = new FieldValues(slotDesc, true, true);
                     if (slotValues != null) {
                         slotValues[i] = values;
                     } else if (obj != null) {
-                        if (handles.lookupException(passHandle) == null) {
-                            // passHandle NOT marked with an exception; set field values
-                            values.defaultCheckFieldValues(obj);
-                            values.defaultSetFieldValues(obj);
+                        try {
+                            if (handles.lookupException(passHandle) == null) {
+                                // passHandle NOT marked with an exception; set field values
+                                values.defaultCheckFieldValues(obj);
+                                values.defaultSetFieldValues(obj);
+                            }
+                        } finally {
+                            releaseScratch(values);
                         }
                     }
                 }
@@ -2363,6 +2379,42 @@ public class ObjectInputStream
                 if (slotValues[i] != null)
                     slotValues[i].defaultSetFieldValues(obj);
             }
+            for (int i = 0; i < slots.length; i++) {
+                if (slotValues[i] != null)
+                    releaseScratch(slotValues[i]);
+            }
+        }
+    }
+
+    /**
+     * Returns a stream-level byte array of at least the requested length,
+     * growing the scratch buffer when necessary.
+     */
+    private byte[] ensureScratchPrimValues(int length) {
+        if (scratchPrimValues == null || scratchPrimValues.length < length) {
+            scratchPrimValues = new byte[length];
+        }
+        return scratchPrimValues;
+    }
+
+    /**
+     * Returns a stream-level object array of at least the requested length,
+     * growing the scratch buffer when necessary.
+     */
+    private Object[] ensureScratchObjValues(int length) {
+        if (scratchObjValues == null || scratchObjValues.length < length) {
+            scratchObjValues = new Object[length];
+        }
+        return scratchObjValues;
+    }
+
+    /**
+     * Releases the stream-level scratch arrays borrowed by the given
+     * FieldValues, allowing a later internal read to reuse them.
+     */
+    private void releaseScratch(FieldValues values) {
+        if (values.usesScratch) {
+            scratchInUse = false;
         }
     }
 
@@ -2451,6 +2503,8 @@ public class ObjectInputStream
         final Object[] objValues;
         /** object field value handles */
         private final int[] objHandles;
+        /** true if the arrays above are borrowed from the stream-level scratch */
+        final boolean usesScratch;
 
         /**
          * Creates FieldValues object for reading fields defined in given
@@ -2460,25 +2514,58 @@ public class ObjectInputStream
          *                           from current PassHandle and the object's read.
          */
         FieldValues(ObjectStreamClass desc, boolean recordDependencies) throws IOException {
+            this(desc, recordDependencies, false);
+        }
+
+        /**
+         * Creates FieldValues object for reading fields defined in given
+         * class descriptor.
+         * @param desc the ObjectStreamClass to read
+         * @param recordDependencies if true, record the dependencies
+         *                           from current PassHandle and the object's read
+         * @param useScratch if true, borrow the stream-level scratch arrays
+         *                   (only valid when the values never escape)
+         */
+        FieldValues(ObjectStreamClass desc, boolean recordDependencies,
+                    boolean useScratch) throws IOException
+        {
             this.desc = desc;
 
+            boolean borrowed = useScratch && !scratchInUse;
+            usesScratch = borrowed;
+            if (borrowed) {
+                scratchInUse = true;
+            }
+
             int primDataSize = desc.getPrimDataSize();
-            primValues = (primDataSize > 0) ? new byte[primDataSize] : null;
+            primValues = (primDataSize > 0)
+                ? (borrowed ? ensureScratchPrimValues(primDataSize)
+                            : new byte[primDataSize])
+                : null;
             if (primDataSize > 0) {
                 bin.readFully(primValues, 0, primDataSize, false);
             }
 
             int numObjFields = desc.getNumObjFields();
-            objValues = (numObjFields > 0) ? new Object[numObjFields] : null;
-            objHandles = (numObjFields > 0) ? new int[numObjFields] : null;
+            objValues = (numObjFields > 0)
+                ? (borrowed ? ensureScratchObjValues(numObjFields)
+                            : new Object[numObjFields])
+                : null;
+            // objHandles are only needed when the values are returned to user
+            // code through readFields(); internal default-read paths never use
+            // them, so do not allocate there.
+            objHandles = (!recordDependencies && numObjFields > 0)
+                ? new int[numObjFields] : null;
             if (numObjFields > 0) {
                 int objHandle = passHandle;
                 ObjectStreamField[] fields = desc.getFields(false);
-                int numPrimFields = fields.length - objValues.length;
-                for (int i = 0; i < objValues.length; i++) {
+                int numPrimFields = fields.length - numObjFields;
+                for (int i = 0; i < numObjFields; i++) {
                     ObjectStreamField f = fields[numPrimFields + i];
                     objValues[i] = readObject0(Object.class, f.isUnshared());
-                    objHandles[i] = passHandle;
+                    if (objHandles != null) {
+                        objHandles[i] = passHandle;
+                    }
                     if (recordDependencies && f.getField() != null) {
                         handles.markDependency(objHandle, passHandle);
                     }
