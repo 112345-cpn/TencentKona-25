@@ -180,6 +180,10 @@ public class ObjectOutputStream
     private final HandleTable handles;
     /** obj -> replacement obj map */
     private final ReplaceTable subs;
+    /** most recently written class descriptor and its handle; fast path for
+     *  repeated writes of the same descriptor (cleared together with handles) */
+    private ObjectStreamClass lastDesc;
+    private int lastDescHandle = -1;
     /** stream protocol version */
     private int protocol = PROTOCOL_VERSION_2;
     /** recursion depth */
@@ -998,6 +1002,8 @@ public class ObjectOutputStream
     private void clear() {
         subs.clear();
         handles.clear();
+        lastDesc = null;
+        lastDescHandle = -1;
     }
 
     /**
@@ -1124,8 +1130,16 @@ public class ObjectOutputStream
         int handle;
         if (desc == null) {
             writeNull();
-        } else if (!unshared && (handle = handles.lookup(desc)) != -1) {
-            writeHandle(handle);
+        } else if (!unshared) {
+            if (desc == lastDesc) {
+                writeHandle(lastDescHandle);
+            } else if ((handle = handles.lookup(desc)) != -1) {
+                writeHandle(handle);
+            } else if (desc.isProxy()) {
+                writeProxyDesc(desc, unshared);
+            } else {
+                writeNonProxyDesc(desc, unshared);
+            }
         } else if (desc.isProxy()) {
             writeProxyDesc(desc, unshared);
         } else {
@@ -1140,7 +1154,7 @@ public class ObjectOutputStream
         throws IOException
     {
         bout.writeByte(TC_PROXYCLASSDESC);
-        handles.assign(unshared ? null : desc);
+        int handle = handles.assign(unshared ? null : desc);
 
         Class<?> cl = desc.forClass();
         Class<?>[] ifaces = cl.getInterfaces();
@@ -1155,6 +1169,10 @@ public class ObjectOutputStream
         bout.writeByte(TC_ENDBLOCKDATA);
 
         writeClassDesc(desc.getSuperDesc(), false);
+        if (!unshared) {
+            lastDesc = desc;
+            lastDescHandle = handle;
+        }
     }
 
     /**
@@ -1165,7 +1183,7 @@ public class ObjectOutputStream
         throws IOException
     {
         bout.writeByte(TC_CLASSDESC);
-        handles.assign(unshared ? null : desc);
+        int handle = handles.assign(unshared ? null : desc);
 
         if (protocol == PROTOCOL_VERSION_1) {
             // do not invoke class descriptor write hook with old protocol
@@ -1181,6 +1199,10 @@ public class ObjectOutputStream
         bout.writeByte(TC_ENDBLOCKDATA);
 
         writeClassDesc(desc.getSuperDesc(), false);
+        if (!unshared) {
+            lastDesc = desc;
+            lastDescHandle = handle;
+        }
     }
 
     /**
