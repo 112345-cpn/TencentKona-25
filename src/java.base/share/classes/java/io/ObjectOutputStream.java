@@ -1135,6 +1135,10 @@ public class ObjectOutputStream
                 writeHandle(lastDescHandle);
             } else if ((handle = handles.lookup(desc)) != -1) {
                 writeHandle(handle);
+                // Remember this descriptor so that an immediately following
+                // write of the same descriptor can skip the hash lookup.
+                lastDesc = desc;
+                lastDescHandle = handle;
             } else if (desc.isProxy()) {
                 writeProxyDesc(desc, unshared);
             } else {
@@ -1154,7 +1158,7 @@ public class ObjectOutputStream
         throws IOException
     {
         bout.writeByte(TC_PROXYCLASSDESC);
-        int handle = handles.assign(unshared ? null : desc);
+        handles.assign(unshared ? null : desc);
 
         Class<?> cl = desc.forClass();
         Class<?>[] ifaces = cl.getInterfaces();
@@ -1169,10 +1173,6 @@ public class ObjectOutputStream
         bout.writeByte(TC_ENDBLOCKDATA);
 
         writeClassDesc(desc.getSuperDesc(), false);
-        if (!unshared) {
-            lastDesc = desc;
-            lastDescHandle = handle;
-        }
     }
 
     /**
@@ -1183,7 +1183,7 @@ public class ObjectOutputStream
         throws IOException
     {
         bout.writeByte(TC_CLASSDESC);
-        int handle = handles.assign(unshared ? null : desc);
+        handles.assign(unshared ? null : desc);
 
         if (protocol == PROTOCOL_VERSION_1) {
             // do not invoke class descriptor write hook with old protocol
@@ -1199,10 +1199,6 @@ public class ObjectOutputStream
         bout.writeByte(TC_ENDBLOCKDATA);
 
         writeClassDesc(desc.getSuperDesc(), false);
-        if (!unshared) {
-            lastDesc = desc;
-            lastDescHandle = handle;
-        }
     }
 
     /**
