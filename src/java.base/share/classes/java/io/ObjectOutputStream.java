@@ -2106,10 +2106,16 @@ public class ObjectOutputStream
          */
         HandleTable(int initialCapacity, float loadFactor) {
             this.loadFactor = loadFactor;
-            spine = new int[initialCapacity];
+            // round spine capacity up to a power of two so lookups can use a
+            // bit mask instead of an integer modulo operation
+            int spineCapacity = 1;
+            while (spineCapacity < initialCapacity) {
+                spineCapacity <<= 1;
+            }
+            spine = new int[spineCapacity];
             next = new int[initialCapacity];
             objs = new Object[initialCapacity];
-            threshold = (int) (initialCapacity * loadFactor);
+            threshold = (int) (spineCapacity * loadFactor);
             clear();
         }
 
@@ -2136,7 +2142,7 @@ public class ObjectOutputStream
             if (size == 0) {
                 return -1;
             }
-            int index = hash(obj) % spine.length;
+            int index = hash(obj) & (spine.length - 1);
             for (int i = spine[index]; i >= 0; i = next[i]) {
                 if (objs[i] == obj) {
                     return i;
@@ -2166,7 +2172,7 @@ public class ObjectOutputStream
          * is large enough to accommodate new mapping.
          */
         private void insert(Object obj, int handle) {
-            int index = hash(obj) % spine.length;
+            int index = hash(obj) & (spine.length - 1);
             objs[handle] = obj;
             next[handle] = spine[index];
             spine[index] = handle;
@@ -2177,7 +2183,7 @@ public class ObjectOutputStream
          * buckets in a conventional hash table.
          */
         private void growSpine() {
-            spine = new int[(spine.length << 1) + 1];
+            spine = new int[spine.length << 1];
             threshold = (int) (spine.length * loadFactor);
             Arrays.fill(spine, -1);
             for (int i = 0; i < size; i++) {
