@@ -314,8 +314,18 @@ public class ObjectInputStream
 
     /** wire handle -> obj/exception map */
     private final HandleTable handles;
-    /** lazily sized scratch arrays reused by short-lived internal FieldValues
-     *  reads (never exposed to user code) */
+    /**
+     * Lazily sized scratch arrays reused by short-lived internal FieldValues
+     * reads (never exposed to user code).
+     *
+     * <p>Note: {@code scratchObjValues} keeps references to the last
+     * deserialized object's field values until they are overwritten by a later
+     * read (or the stream becomes unreachable).  This is the deliberate
+     * tradeoff for the reduced allocation rate; callers that deserialize only a
+     * few objects into a long-lived stream may observe delayed collection of
+     * those objects.  Only one logical consumer may borrow the scratch at a
+     * time; nested or concurrent internal reads fall back to private arrays.
+     */
     private byte[] scratchPrimValues;
     private Object[] scratchObjValues;
     /** true while the scratch arrays above are borrowed by a FieldValues */
@@ -2338,6 +2348,11 @@ public class ObjectInputStream
                     // Read fields of the current descriptor into a new FieldValues
                     FieldValues values = new FieldValues(slotDesc, true, true);
                     if (slotValues != null) {
+                        // Deferred (failure-atomic) mode keeps the values alive
+                        // until the whole hierarchy has been read.  At most one
+                        // outstanding slot can borrow the single scratch pair;
+                        // any further slots fall back to private arrays, which
+                        // keeps the reuse safe for multi-slot hierarchies.
                         slotValues[i] = values;
                     } else if (obj != null) {
                         try {
@@ -2537,40 +2552,51 @@ public class ObjectInputStream
                 scratchInUse = true;
             }
 
-            int primDataSize = desc.getPrimDataSize();
-            primValues = (primDataSize > 0)
-                ? (borrowed ? ensureScratchPrimValues(primDataSize)
-                            : new byte[primDataSize])
-                : null;
-            if (primDataSize > 0) {
-                bin.readFully(primValues, 0, primDataSize, false);
-            }
-
-            int numObjFields = desc.getNumObjFields();
-            objValues = (numObjFields > 0)
-                ? (borrowed ? ensureScratchObjValues(numObjFields)
-                            : new Object[numObjFields])
-                : null;
-            // objHandles are only needed when the values are returned to user
-            // code through readFields(); internal default-read paths never use
-            // them, so do not allocate there.
-            objHandles = (!recordDependencies && numObjFields > 0)
-                ? new int[numObjFields] : null;
-            if (numObjFields > 0) {
-                int objHandle = passHandle;
-                ObjectStreamField[] fields = desc.getFields(false);
-                int numPrimFields = fields.length - numObjFields;
-                for (int i = 0; i < numObjFields; i++) {
-                    ObjectStreamField f = fields[numPrimFields + i];
-                    objValues[i] = readObject0(Object.class, f.isUnshared());
-                    if (objHandles != null) {
-                        objHandles[i] = passHandle;
-                    }
-                    if (recordDependencies && f.getField() != null) {
-                        handles.markDependency(objHandle, passHandle);
-                    }
+            try {
+                int primDataSize = desc.getPrimDataSize();
+                primValues = (primDataSize > 0)
+                    ? (borrowed ? ensureScratchPrimValues(primDataSize)
+                                : new byte[primDataSize])
+                    : null;
+                if (primDataSize > 0) {
+                    bin.readFully(primValues, 0, primDataSize, false);
                 }
-                passHandle = objHandle;
+
+                int numObjFields = desc.getNumObjFields();
+                objValues = (numObjFields > 0)
+                    ? (borrowed ? ensureScratchObjValues(numObjFields)
+                                : new Object[numObjFields])
+                    : null;
+                // objHandles are only needed when the values are returned to
+                // user code through readFields(); internal default-read paths
+                // never use them, so do not allocate there.
+                objHandles = (!recordDependencies && numObjFields > 0)
+                    ? new int[numObjFields] : null;
+                if (numObjFields > 0) {
+                    int objHandle = passHandle;
+                    ObjectStreamField[] fields = desc.getFields(false);
+                    int numPrimFields = fields.length - numObjFields;
+                    for (int i = 0; i < numObjFields; i++) {
+                        ObjectStreamField f = fields[numPrimFields + i];
+                        objValues[i] = readObject0(Object.class, f.isUnshared());
+                        if (objHandles != null) {
+                            objHandles[i] = passHandle;
+                        }
+                        if (recordDependencies && f.getField() != null) {
+                            handles.markDependency(objHandle, passHandle);
+                        }
+                    }
+                    passHandle = objHandle;
+                }
+            } catch (IOException | RuntimeException | Error e) {
+                // A failed read normally leaves the stream unusable, but release
+                // the scratch anyway so that a stream which does recover does
+                // not silently lose the allocation optimization for its whole
+                // remaining lifetime.
+                if (borrowed) {
+                    scratchInUse = false;
+                }
+                throw e;
             }
         }
 
